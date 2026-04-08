@@ -14,9 +14,12 @@
 
 #include "openarm_hardware/v10_simple_hardware.hpp"
 
+#include <Eigen/Core>
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <cmath>
+#include <sstream>
 #include <thread>
 #include <vector>
 
@@ -60,6 +63,24 @@ bool OpenArm_v10HW::parse_config(const hardware_interface::HardwareInfo& info) {
     can_fd_ = (value == "true");
   }
 
+  // Parse gravity compensation enable (default: false)
+  it = info.hardware_parameters.find("use_gravity_compensation");
+  if (it == info.hardware_parameters.end()) {
+    use_gravity_compensation_ = false;  // Default to false
+  } else {
+    // Handle both "true"/"True" and "false"/"False"
+    std::string value = it->second;
+    std::transform(value.begin(), value.end(), value.begin(), ::tolower);
+    use_gravity_compensation_ = (value == "true");
+  }
+
+  // Parse robot_description for URDF (optional, will fallback to parameter
+  // server)
+  it = info.hardware_parameters.find("robot_description");
+  if (it != info.hardware_parameters.end()) {
+    robot_description_ = it->second;
+  }
+
   // Parse control gains
   for (size_t i = 1; i <= ARM_DOF; ++i) {
     it = info.hardware_parameters.find("kp" + std::to_string(i));
@@ -73,17 +94,39 @@ bool OpenArm_v10HW::parse_config(const hardware_interface::HardwareInfo& info) {
   }
 
   RCLCPP_INFO(rclcpp::get_logger("OpenArm_v10HW"),
-              "Configuration: CAN=%s, arm_prefix=%s, hand=%s, can_fd=%s",
+              "Configuration: CAN=%s, arm_prefix=%s, hand=%s, can_fd=%s, "
+              "grav_comp=%s",
               can_interface_.c_str(), arm_prefix_.c_str(),
-              hand_ ? "enabled" : "disabled", can_fd_ ? "enabled" : "disabled");
+              hand_ ? "enabled" : "disabled", can_fd_ ? "enabled" : "disabled",
+              use_gravity_compensation_ ? "enabled" : "disabled");
   return true;
 }
 
 void OpenArm_v10HW::generate_joint_names() {
   joint_names_.clear();
-  // TODO: read from urdf properly and sort in the future.
-  // Currently, the joint names are hardcoded for order consistency to align
-  // with hardware. Generate arm joint names: openarm_{arm_prefix}joint{N}
+
+  // If we have a Pinocchio model loaded from URDF, extract joint names from it
+  // Filter for movable joints (exclude fixed joints and the root joint)
+  if (model_.nq > 0) {
+    RCLCPP_INFO(rclcpp::get_logger("OpenArm_v10HW"),
+                "Extracting joint names from URDF model...");
+    for (const auto& joint_name : model_.names) {
+      // Skip "universe" (root joint) and any empty names
+      if (joint_name.empty() || joint_name == "universe") {
+        continue;
+      }
+      // Check if joint is in the arm prefix (or use all if no prefix)
+      if (arm_prefix_.empty() || joint_name.find(arm_prefix_) != std::string::npos) {
+        joint_names_.push_back(joint_name);
+      }
+    }
+    RCLCPP_INFO(rclcpp::get_logger("OpenArm_v10HW"),
+                "Generated %zu joint names from URDF model", joint_names_.size());
+    return;
+  }
+
+  // Fallback: generate arm joint names using hardcoded pattern
+  // openarm_{arm_prefix}joint{N}
   for (size_t i = 1; i <= ARM_DOF; ++i) {
     std::string joint_name =
         "openarm_" + arm_prefix_ + "joint" + std::to_string(i);
@@ -102,7 +145,7 @@ void OpenArm_v10HW::generate_joint_names() {
   }
 
   RCLCPP_INFO(rclcpp::get_logger("OpenArm_v10HW"),
-              "Generated %zu joint names for arm prefix '%s'",
+              "Generated %zu joint names for arm prefix '%s' using hardcoded pattern",
               joint_names_.size(), arm_prefix_.c_str());
 }
 
@@ -113,6 +156,25 @@ hardware_interface::CallbackReturn OpenArm_v10HW::on_init(
     return CallbackReturn::ERROR;
   }
   // Parse configuration
+  if (!parse_config(info)) {
+    return CallbackReturn::ERROR;
+  }
+
+  // Load URDF early if robot_description is provided in hardware parameters
+  // This allows generate_joint_names to use URDF joint names
+  if (!robot_description_.empty() && use_gravity_compensation_) {
+    RCLCPP_INFO(rclcpp::get_logger("OpenArm_v10HW"),
+                "URDF provided in hardware parameters, loading early...");
+    if (!load_urdf_and_initialize_pinocchio()) {
+      RCLCPP_WARN(rclcpp::get_logger("OpenArm_v10HW"),
+                  "Failed to load URDF early. Will fallback to hardcoded joint names.");
+      // Don't return ERROR here - gravity comp will be disabled in on_configure
+      use_gravity_compensation_ = false;
+    }
+  }
+
+  // Generate joint names based on arm prefix (or URDF if loaded)
+  generate_joint_names();
   if (!parse_config(info)) {
     return CallbackReturn::ERROR;
   }
@@ -169,6 +231,29 @@ hardware_interface::CallbackReturn OpenArm_v10HW::on_configure(
   openarm_->refresh_all();
   std::this_thread::sleep_for(std::chrono::milliseconds(100));
   openarm_->recv_all();
+
+  // Initialize Pinocchio if gravity compensation is enabled
+  // Skip if already loaded in on_init()
+  if (use_gravity_compensation_ && model_.nq == 0) {
+    RCLCPP_INFO(rclcpp::get_logger("OpenArm_v10HW"),
+                "Gravity compensation enabled, loading URDF and "
+                "initializing Pinocchio...");
+    if (!load_urdf_and_initialize_pinocchio()) {
+      RCLCPP_ERROR(rclcpp::get_logger("OpenArm_v10HW"),
+                   "Failed to load URDF and initialize Pinocchio. "
+                   "Gravity compensation will be disabled.");
+      use_gravity_compensation_ = false;
+      return CallbackReturn::ERROR;
+    }
+    RCLCPP_INFO(rclcpp::get_logger("OpenArm_v10HW"),
+                "Pinocchio initialized successfully for gravity compensation");
+  } else if (use_gravity_compensation_) {
+    RCLCPP_INFO(rclcpp::get_logger("OpenArm_v10HW"),
+                "Pinocchio already initialized, skipping URDF loading");
+  } else {
+    RCLCPP_INFO(rclcpp::get_logger("OpenArm_v10HW"),
+                "Gravity compensation disabled, skipping URDF loading");
+  }
 
   return CallbackReturn::SUCCESS;
 }
@@ -269,13 +354,55 @@ hardware_interface::return_type OpenArm_v10HW::read(
 
 hardware_interface::return_type OpenArm_v10HW::write(
     const rclcpp::Time& /*time*/, const rclcpp::Duration& /*period*/) {
+  // Compute gravity-compensated torques if enabled
+  std::vector<double> tau_feedforward(joint_names_.size(), 0.0);
+
+  if (use_gravity_compensation_) {
+    // Build joint position and velocity vectors for all controlled joints
+    Eigen::VectorXd q(model_.nq);
+    Eigen::VectorXd v(model_.nv);
+    q.setZero();
+    v.setZero();
+
+    // Map hardware joint positions and velocities to Pinocchio model
+    // configuration
+    for (size_t i = 0; i < joint_names_.size(); ++i) {
+      const auto& joint_name = joint_names_[i];
+      if (model_.existJointName(joint_name)) {
+        auto joint_id = model_.getJointId(joint_name);
+        auto q_idx = model_.idx_qs[joint_id];
+        auto v_idx = model_.idx_vs[joint_id];
+        q[q_idx] = pos_states_[i];
+        v[v_idx] = vel_states_[i];
+      }
+    }
+
+    // Compute gravity and velocity-dependent torques via RNEA (includes
+    // Coriolis/centrifugal)
+    Eigen::VectorXd tau_gravity = compute_gravity_torques(q, v);
+
+    // Map gravity torques back to hardware joint order
+    for (size_t i = 0; i < joint_names_.size(); ++i) {
+      const auto& joint_name = joint_names_[i];
+      if (model_.existJointName(joint_name)) {
+        auto joint_id = model_.getJointId(joint_name);
+        auto joint_idx = model_.idx_vs[joint_id];
+        tau_feedforward[i] = tau_gravity[joint_idx];
+      }
+    }
+  }
+
   // Control arm motors with MIT control
   std::vector<openarm::damiao_motor::MITParam> arm_params;
   for (size_t i = 0; i < ARM_DOF; ++i) {
+    double tau_pd = tau_commands_[i];  // Use commanded torque from controller
+    double tau_cmd = tau_feedforward[i] + tau_pd;
+
     arm_params.push_back(
-        {kp_[i], kd_[i], pos_commands_[i], vel_commands_[i], tau_commands_[i]});
+        {kp_[i], kd_[i], pos_commands_[i], vel_commands_[i], tau_cmd});
   }
   openarm_->get_arm().mit_control_all(arm_params);
+
   // Control gripper if enabled
   if (hand_ && joint_names_.size() > ARM_DOF) {
     // TODO the true mappings are unimplemented.
@@ -283,6 +410,7 @@ hardware_interface::return_type OpenArm_v10HW::write(
     openarm_->get_gripper().mit_control_all(
         {{GRIPPER_KP, GRIPPER_KD, motor_command, 0, 0}});
   }
+
   openarm_->recv_all(1000);
   return hardware_interface::return_type::OK;
 }
@@ -319,6 +447,86 @@ double OpenArm_v10HW::motor_radians_to_joint(double motor_radians) {
   return GRIPPER_JOINT_0_POSITION *
          (motor_radians /
           GRIPPER_MOTOR_1_RADIANS);  // Scale from 0 to -1.0472 to 0-0.044
+}
+
+// URDF loading and Pinocchio initialization
+bool OpenArm_v10HW::load_urdf_and_initialize_pinocchio() {
+  // If robot_description is not in hardware parameters, try to get it from
+  // parameter server
+  if (robot_description_.empty()) {
+    RCLCPP_WARN(rclcpp::get_logger("OpenArm_v10HW"),
+                "robot_description not provided in hardware parameters, "
+                "attempting to read from /robot_description parameter...");
+
+    // Create a temporary node to read the parameter
+    auto node = rclcpp::Node::make_shared("openarm_hw_urdf_loader");
+    if (!node->has_parameter("robot_description")) {
+      node->declare_parameter<std::string>("robot_description", "");
+    }
+
+    try {
+      robot_description_ = node->get_parameter("robot_description").as_string();
+    } catch (const std::exception& e) {
+      RCLCPP_ERROR(rclcpp::get_logger("OpenArm_v10HW"),
+                   "Failed to read /robot_description parameter: %s", e.what());
+      return false;
+    }
+  }
+
+  if (robot_description_.empty()) {
+    RCLCPP_ERROR(rclcpp::get_logger("OpenArm_v10HW"),
+                 "URDF is empty! Please ensure /robot_description parameter is "
+                 "published or provide it in hardware parameters.");
+    return false;
+  }
+
+  RCLCPP_INFO(rclcpp::get_logger("OpenArm_v10HW"),
+              "URDF loaded successfully (%zu bytes)",
+              robot_description_.size());
+
+  // Build Pinocchio model from URDF XML string
+  try {
+    pinocchio::urdf::buildModelFromXML(robot_description_, model_);
+    data_ = pinocchio::Data(model_);
+
+    // Set gravity vector: [0, 0, -9.81] m/s^2
+    model_.gravity.linear(Eigen::Vector3d(0.0, 0.0, -9.81));
+
+    RCLCPP_INFO(rclcpp::get_logger("OpenArm_v10HW"),
+                "Pinocchio model initialized with %d DOF, %zu joints",
+                model_.nv, model_.joints.size());
+  } catch (const std::exception& e) {
+    RCLCPP_ERROR(rclcpp::get_logger("OpenArm_v10HW"),
+                 "Failed to build Pinocchio model from URDF: %s", e.what());
+    return false;
+  }
+
+  // Validate that all hardware joints exist in the URDF model
+  for (const auto& joint_name : joint_names_) {
+    if (!model_.existJointName(joint_name)) {
+      RCLCPP_ERROR(
+          rclcpp::get_logger("OpenArm_v10HW"),
+          "Joint '%s' from hardware configuration not found in URDF model",
+          joint_name.c_str());
+      return false;
+    }
+  }
+
+  RCLCPP_INFO(rclcpp::get_logger("OpenArm_v10HW"),
+              "All %zu hardware joints validated in URDF model",
+              joint_names_.size());
+  return true;
+}
+
+// Compute gravity torques using Pinocchio RNEA
+Eigen::VectorXd OpenArm_v10HW::compute_gravity_torques(
+    const Eigen::VectorXd& q, const Eigen::VectorXd& v) {
+  // RNEA with actual velocities and zero acceleration gives:
+  // tau = C(q, q_dot)q_dot + g(q)
+  // This includes Coriolis/centrifugal forces (velocity-dependent) and gravity
+  Eigen::VectorXd a = Eigen::VectorXd::Zero(model_.nv);
+
+  return pinocchio::rnea(model_, data_, q, v, a);
 }
 
 }  // namespace openarm_hardware

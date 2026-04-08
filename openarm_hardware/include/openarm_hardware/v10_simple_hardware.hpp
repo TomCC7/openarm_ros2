@@ -14,10 +14,16 @@
 
 #pragma once
 
+#include <Eigen/Core>
 #include <chrono>
 #include <memory>
 #include <openarm/can/socket/openarm.hpp>
 #include <openarm/damiao_motor/dm_motor_constants.hpp>
+#include <pinocchio/algorithm/rnea.hpp>
+#include <pinocchio/fwd.hpp>
+#include <pinocchio/multibody/data.hpp>
+#include <pinocchio/multibody/model.hpp>
+#include <pinocchio/parsers/urdf.hpp>
 #include <string>
 #include <vector>
 
@@ -116,9 +122,15 @@ class OpenArm_v10HW : public hardware_interface::SystemInterface {
   std::string arm_prefix_;
   bool hand_;
   bool can_fd_;
+  bool use_gravity_compensation_;
+  std::string robot_description_;
 
   // OpenArm instance
   std::unique_ptr<openarm::can::socket::OpenArm> openarm_;
+
+  // Pinocchio model and data for gravity compensation
+  pinocchio::Model model_;
+  pinocchio::Data data_;
 
   // Generated joint names for this arm instance
   std::vector<std::string> joint_names_;
@@ -139,6 +151,11 @@ class OpenArm_v10HW : public hardware_interface::SystemInterface {
   // Gripper mapping functions
   double joint_to_motor_radians(double joint_value);
   double motor_radians_to_joint(double motor_radians);
+
+  // Gravity compensation using Pinocchio
+  bool load_urdf_and_initialize_pinocchio();
+  Eigen::VectorXd compute_gravity_torques(const Eigen::VectorXd& q,
+                                          const Eigen::VectorXd& v);
 };
 
 }  // namespace openarm_hardware
